@@ -444,6 +444,12 @@ def with_sharding_constraint(x, shardings):
     return jax.lax.with_sharding_constraint(x, shardings)
 
 
+def maybe_shard(x: NestedTensor, partition_spec: Optional[PartitionSpec]) -> NestedTensor:
+    if partition_spec is None:
+        return x
+    return with_sharding_constraint(x, PartitionSpec(*partition_spec))
+
+
 def replicate_to_local_data(x: NestedTensor) -> NestedTensor:
     """Replicates and converts Tensors in `x` to local DeviceArrays.
 
@@ -1441,3 +1447,15 @@ def sequence_mask(*, lengths: Tensor, max_len: int, dtype: Optional[jnp.dtype] =
     # [..., 1]
     lengths = lengths[..., jnp.newaxis]
     return (sequence < lengths).astype(dtype)
+
+
+def validate_contains_paths(x: Nested[Tensor], paths: Sequence[str]):
+    """Raises ValueError if any of the given `paths` are not present in `x`."""
+    for path in paths:
+        try:
+            get_recursively(x, path)
+        except KeyError as e:
+            raise ValueError(
+                f"Input is expected to contain '{path}'; "
+                f"instead, it contains: '{jax.tree_structure(x)}'."
+            ) from e
