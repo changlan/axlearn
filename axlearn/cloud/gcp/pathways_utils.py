@@ -5,10 +5,13 @@
 import copy
 import logging
 import os
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence, Union
+
+from absl import flags
 
 from axlearn.cloud.common.bastion import BASTION_JOB_VERSION_ENV_VAR
 from axlearn.cloud.common.bundler import Bundler
+from axlearn.cloud.common.utils import parse_kv_flags
 from axlearn.cloud.gcp.jobset_utils import (
     _ANNOTATION_NODE_SERVICE_ACCOUNT,
     _METADATA_GOOGLE_INTERNAL_IP,
@@ -18,7 +21,11 @@ from axlearn.cloud.gcp.jobset_utils import (
     _LoadBalancer,
 )
 from axlearn.cloud.gcp.system_characteristics import USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS
-from axlearn.common.compiler_options import infer_tpu_type
+from axlearn.common.compiler_options import (
+    default_xla_options,
+    infer_tpu_type,
+    xla_flags_from_options,
+)
 from axlearn.common.config import REQUIRED, Required, config_class
 from axlearn.common.utils import Nested
 
@@ -47,20 +54,28 @@ _PATHWAYS_SERVER_IMAGE = (
 _PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME = "pathways-rm"
 # The container name of pathways proxy.
 _PATHWAYS_PROXY_CONTAINER_NAME = "pathways-proxy"
-# The node pool name for pathways-head pod.
-_PATHWAYS_HEAD_NODE_POOL_NAME = "pathways-head"
 # The k8s replicatedJob name for pathways-head pods.
 _PATHWAYS_HEAD_REPLICATED_JOB_NAME = "pathways-head"
 # The k8s replicatedJob name for pathways-worker pods.
 _PATHWAYS_WORKER_REPLICATED_JOB_NAME = "pathways-worker"
 
+# Add node-selector for cpu workload to avoid sharing nodes with system services.
+_PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY = "axlearn/nodepool_type"
+_PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE = "workload"
 
-def get_pathways_head_address(job_name: str) -> str:
-    """Returns the address of the pathways head pod."""
-    # There will be only one pathways-head pod, so it is already 0-0.
-    # First 0 means the first replicatedJob of pathways-head,
-    # the second 0 means the first pod in the replicatedJob.
-    return f"{job_name}-{_PATHWAYS_HEAD_REPLICATED_JOB_NAME}-0-0.{job_name}"
+
+def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
+    """Attempts to convert an XLA flag string value to int, then bool.
+
+    If conversion fails, returns the original string (stripped).
+    """
+    bool_mapper = {"true": True, "false": False}
+    stripped_value_str = value.strip()
+    try:
+        return int(stripped_value_str)
+    except ValueError:
+        # Not an integer, try boolean conversion.
+        return bool_mapper.get(stripped_value_str.lower(), stripped_value_str)
 
 
 def get_pathways_tpu_version(gke_machine_type: str) -> str:
@@ -82,12 +97,86 @@ def get_pathways_tpu_version(gke_machine_type: str) -> str:
     return pathways_tpu_devices[gke_machine_type.lower()]
 
 
+def get_megascale_options(
+    xla_options: dict[str, Union[str, bool, int]]
+) -> dict[str, Union[str, bool, int]]:
+    """Filters XLA options for those pertaining to Megascale.
+
+    Args:
+        xla_options: A dictionary of XLA options.
+
+    Returns:
+        A dictionary containing only Megascale-related XLA options
+        (those starting with 'megascale').
+    """
+    return {k: v for k, v in xla_options.items() if k.startswith("megascale")}
+
+
+def get_xla_options(
+    xla_options: dict[str, Union[str, bool, int]]
+) -> dict[str, Union[str, bool, int]]:
+    """Filters XLA options for those starting with 'xla_'.
+
+    Args:
+        xla_options: A dictionary of XLA options.
+
+    Returns:
+        A dictionary containing only XLA-specific options (those starting with 'xla').
+    """
+    return {k: v for k, v in xla_options.items() if k.startswith("xla_")}
+
+
 class PathwaysReplicatedJob(BaseReplicatedJob):
     """Builds a replicated jobspec for Pathways on TPU, to be used with JobSet API."""
 
     @config_class
     class Config(BaseReplicatedJob.Config):
+        """Configures PathwaysReplicatedJob.
+
+        Attributes:
+            inner: The wrapped TPUReplicatedJob configuration.
+            pathways_head_cpu: CPU request for pathways-head container.
+            pathways_head_mem: Memory request for pathways-head container.
+        """
+
         inner: Required[TPUReplicatedJob.Config] = REQUIRED
+        pathways_xla_flags: list[str] = []
+        pathways_head_cpu: Optional[str] = None
+        pathways_head_mem: Optional[str] = None
+
+    @classmethod
+    def define_flags(cls, fv):
+        super().define_flags(fv)
+        common_kwargs = dict(flag_values=fv, allow_override=True)
+        # XLA flags and megascale flags have to be passed at jobset creation time.
+        # The XLA flags automatically get passed to the pathways proxy and the
+        # Megascale flags get passed to pathways workers. A single flag is used since
+        # the implementation details could change later.
+        flags.DEFINE_list(
+            "pathways_xla_flags",
+            [],
+            "Set XLA and Megascale flags. Defaults are set by compiler_options.py. "
+            "Example: 'xla_tpu_x=24,megascale_y=true'",
+            **common_kwargs,
+        )
+        flags.DEFINE_string(
+            "pathways_head_cpu",
+            None,
+            "CPU request for pathways-head container in cores. Default is 1 core.",
+            **common_kwargs,
+        )
+        flags.DEFINE_string(
+            "pathways_head_mem",
+            None,
+            "Memory request for pathways-head container in GiB. Default is 16GiB",
+            **common_kwargs,
+        )
+
+    @classmethod
+    def set_defaults(cls, fv):
+        super().set_defaults(fv)
+        fv.set_default("pathways_head_cpu", fv.pathways_head_cpu or "1")
+        fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
 
     @classmethod
     def default_config(cls):
@@ -98,11 +187,28 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         super().__init__(cfg, bundler=bundler)
         self._bundler = bundler
         self._inner: TPUReplicatedJob = cfg.inner.instantiate(bundler=self._bundler)
+        pathways_cfg: PathwaysReplicatedJob.Config = self.config
         self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
             raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
         if cfg.inner.enable_pre_provisioner:
             raise NotImplementedError("Pre-provisioner is currently not supported")
+        self._is_single_head = True
+        xla_and_mxla_options = default_xla_options(
+            instance_type=self._tpu_type,
+            num_slices=cfg.inner.accelerator.num_replicas,
+            backend="tpu",
+        )
+        pathways_xla_flags = parse_kv_flags(pathways_cfg.pathways_xla_flags, delimiter="=")
+        for k, v in pathways_xla_flags.items():
+            k = k.lstrip("--")
+            v = parse_xla_flag_value(v)
+            xla_and_mxla_options[k] = v
+
+        # Needs to be passed to pathways-proxy.
+        self._xla_options = get_xla_options(xla_and_mxla_options)
+        # Needs to be passed as command arguments to each pathways-worker.
+        self._mxla_options = get_megascale_options(xla_and_mxla_options)
 
     def _update_env_list(self, env_list: list[dict], name: str, value: str):
         for env in env_list:
@@ -110,6 +216,18 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 env["value"] = value
                 return
         env_list.append({"name": name, "value": value})
+
+    def _get_pathways_head_address(
+        self, pathways_worker_replicated_job_index: Optional[int] = None
+    ) -> str:
+        """Returns the address of the pathways-head pod.
+        There will be only one pathways-head pod, so it is always 0-0.
+        First 0 means the first replicatedJob of pathways-head,
+        the second 0 means the first pod in the replicatedJob.
+        """
+        assert pathways_worker_replicated_job_index is None
+        cfg: PathwaysReplicatedJob.Config = self.config
+        return f"{cfg.name}-{_PATHWAYS_HEAD_REPLICATED_JOB_NAME}-0-0.{cfg.name}"
 
     def _build_pathways_head_container(self) -> dict:
         """Build the container for the 'pathways-head' role."""
@@ -140,10 +258,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         head_container["env"] = env_list
 
-        # TODO(ethanli): Define the resources for pathways head.
+        cpu_req = f"{float(self.config.pathways_head_cpu) * 1000}m"
+        mem_req = f"{self.config.pathways_head_mem}Gi"
         resources = {
-            "requests": {"cpu": "1000m", "memory": "32Gi"},
-            "limits": {"cpu": "32000m", "memory": "128Gi"},
+            "requests": {"cpu": cpu_req, "memory": mem_req},
+            "limits": {"cpu": cpu_req, "memory": mem_req},
         }
         head_container["resources"] = resources
 
@@ -164,6 +283,17 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         staging_location = f"{cfg.output_dir}/pathways-staging"
         pathways_tpu_version = get_pathways_tpu_version(system.gce_machine_type)
 
+        # If multi-head, every pathways-head will only
+        # be connected to one pathways instance (a pathways-worker replicated job).
+        pathways_instance_count = cfg.accelerator.num_replicas if self._is_single_head else 1
+
+        cmd_args = [
+            f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            f"--server_port={_PATHWAYS_PROXY_PORT}",
+            f"--gcs_scratch_location={staging_location}",
+        ]
+        cmd_args.extend(xla_flags_from_options(self._xla_options).split())
+
         return [
             dict(
                 name=_PATHWAYS_PROXY_CONTAINER_NAME,
@@ -171,11 +301,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 # https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#pod-sidecar-containers
                 # SideCar container is an init container with restartPolicy as "Always".
                 restartPolicy="Always",
-                args=[
-                    f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
-                    f"--server_port={_PATHWAYS_PROXY_PORT}",
-                    f"--gcs_scratch_location={staging_location}",
-                ],
+                args=cmd_args,
                 ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
             ),
             dict(
@@ -193,7 +319,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 args=[
                     f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
                     "--node_type=resource_manager",
-                    f"--instance_count={cfg.accelerator.num_replicas}",
+                    f"--instance_count={pathways_instance_count}",
                     f"--instance_type={pathways_tpu_version}:{system.topology}",
                     f"--gcs_scratch_location={staging_location}",
                 ],
@@ -225,7 +351,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             )
 
         node_selector = {
-            "cloud.google.com/gke-nodepool": _PATHWAYS_HEAD_NODE_POOL_NAME,
+            _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
         }
 
         head_container = self._build_pathways_head_container()
@@ -282,7 +408,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         return head_job
 
-    def _build_pathways_worker_container(self) -> dict:
+    def _build_pathways_worker_container(
+        self, pathways_worker_replicated_job_index: Optional[int] = None
+    ) -> dict:
         """Build the container for the 'pathways-worker' role."""
         cfg: TPUReplicatedJob.Config = self._inner.config
         # pylint: disable-next=protected-access
@@ -291,39 +419,59 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         worker_container = copy.deepcopy(container)
         env_list = worker_container.get("env", [])
 
-        self._update_env_list(
-            env_list, "MEGASCALE_COORDINATOR_ADDRESS", f"{get_pathways_head_address(cfg.name)}"
+        pathways_head_address = self._get_pathways_head_address(
+            pathways_worker_replicated_job_index=pathways_worker_replicated_job_index
         )
-        env_list.extend(
-            [
-                {
-                    "name": "MEGASCALE_NUM_SLICES",
-                    "valueFrom": {
-                        "fieldRef": {
-                            "fieldPath": (
-                                "metadata.labels['jobset.sigs.k8s.io/replicatedjob-replicas']"
-                            )
-                        }
+
+        self._update_env_list(env_list, "MEGASCALE_COORDINATOR_ADDRESS", pathways_head_address)
+
+        if self._is_single_head:
+            env_list.extend(
+                [
+                    {
+                        "name": "MEGASCALE_NUM_SLICES",
+                        "valueFrom": {
+                            "fieldRef": {
+                                "fieldPath": (
+                                    "metadata.labels['jobset.sigs.k8s.io/replicatedjob-replicas']"
+                                )
+                            }
+                        },
                     },
-                },
-                {
-                    "name": "MEGASCALE_SLICE_ID",
-                    "valueFrom": {
-                        "fieldRef": {
-                            "fieldPath": "metadata.labels['jobset.sigs.k8s.io/job-index']",
-                        }
+                    {
+                        "name": "MEGASCALE_SLICE_ID",
+                        "valueFrom": {
+                            "fieldRef": {
+                                "fieldPath": "metadata.labels['jobset.sigs.k8s.io/job-index']",
+                            }
+                        },
                     },
-                },
-            ]
-        )
+                ]
+            )
+        else:
+            env_list.extend(
+                [
+                    {
+                        "name": "MEGASCALE_NUM_SLICES",
+                        "value": "1",
+                    },
+                    {
+                        "name": "MEGASCALE_SLICE_ID",
+                        "value": "0",
+                    },
+                ]
+            )
+
         worker_container["env"] = env_list
 
         worker_container["args"] = [
             f"--server_port={_PATHWAYS_WORKER_PORT}",
-            f"--resource_manager_address={get_pathways_head_address(cfg.name)}:"
+            f"--resource_manager_address={pathways_head_address}:"
             + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
         ]
+        mega_scale_args = xla_flags_from_options(self._mxla_options).split()
+        worker_container["args"].extend(mega_scale_args)
 
         worker_container["image"] = _PATHWAYS_SERVER_IMAGE
 
@@ -338,7 +486,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         return worker_container
 
-    def _build_pathways_worker_pod(self) -> Nested[Any]:
+    def _build_pathways_worker_pod(
+        self, pathways_worker_replicated_job_index: Optional[int] = None
+    ) -> Nested[Any]:
         """Conoverts a worker pod to a new pod for the 'pathways-workers' role."""
         cfg: TPUReplicatedJob.Config = self._inner.config
         # pylint: disable-next=protected-access
@@ -353,7 +503,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pod_spec["hostNetwork"] = True
         # Only set dnsPolicy if it's not already set
         pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
-        pod_spec["containers"] = [self._build_pathways_worker_container()]
+        pod_spec["containers"] = [
+            self._build_pathways_worker_container(pathways_worker_replicated_job_index)
+        ]
         worker_pod["spec"] = pod_spec
 
         # Service account for nodes.
@@ -370,7 +522,10 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         return worker_pod
 
-    def _build_pathways_worker_job(self):
+    def _build_pathways_worker_job(
+        self,
+        pathways_worker_replicated_job_index: Optional[int] = None,
+    ):
         """See `BaseReplicatedJob` docstring for details."""
 
         logging.debug("Building a worker job.")
@@ -379,8 +534,14 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
 
+        replicated_job_name = (
+            _PATHWAYS_WORKER_REPLICATED_JOB_NAME
+            if self._is_single_head
+            else f"{_PATHWAYS_WORKER_REPLICATED_JOB_NAME}-{pathways_worker_replicated_job_index}"
+        )
+
         annotations = _LoadBalancer(
-            jobset_name=cfg.name, replicated_job_name=_PATHWAYS_WORKER_REPLICATED_JOB_NAME
+            jobset_name=cfg.name, replicated_job_name=replicated_job_name
         ).metadata
 
         annotations.update(
@@ -394,7 +555,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             # References:
             # https://github.com/google/pathways-job/blob/4417de7aa23d3c2316e400a3a327512834374475/internal/controller/pathwaysjob_controller.go#L651
             backoffLimit=system.vms_per_slice * 4,
-            template=self._build_pathways_worker_pod(),
+            template=self._build_pathways_worker_pod(pathways_worker_replicated_job_index),
         )
         worker_job = dict(
             metadata=dict(annotations=annotations),
@@ -417,5 +578,62 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 template=self._build_pathways_worker_job(),
             ),
         ]
+
+        return replicated_jobs
+
+
+# TODO (ethanli): Consider refactoring with the modifiers pattern.
+class PathwaysMultiheadReplicatedJob(PathwaysReplicatedJob):
+    """Builds a replicated jobspec for Pathways on TPU for multi-host inference use case,
+    to be used with JobSet API. There will be one pathways-head job for each pathways-worker
+    replicated job. For a job with num_replicas=N, there will be N pathways-head job
+    and N pathways-worker replicated jobs.
+    """
+
+    def __init__(self, cfg: PathwaysReplicatedJob.Config, *, bundler: Bundler):
+        super().__init__(cfg, bundler=bundler)
+        self._is_single_head = False
+
+    def _get_pathways_head_address(
+        self, pathways_worker_replicated_job_index: Optional[int] = None
+    ) -> str:
+        """Returns the address of the pathways head pod.
+        In the multi-head Pathways setup, there will be one pathways-head pod
+        per corresponding pathways-worker k8s job. The pathways-workers from
+        the replicated_job of specified index is configured to connect to
+        their corresponding pathways-head pod.
+
+        Args:
+            pathways_worker_replicated_job_index: the index of the pathways-workers replicated job.
+
+        Returns:
+            The network address of the pathways-head pod.
+        """
+        cfg: PathwaysMultiheadReplicatedJob.Config = self.config
+
+        return (
+            f"{cfg.name}-{_PATHWAYS_HEAD_REPLICATED_JOB_NAME}"
+            f"-{pathways_worker_replicated_job_index}-0.{cfg.name}"
+        )
+
+    def __call__(self) -> Sequence[Nested[Any]]:
+        cfg: TPUReplicatedJob.Config = self._inner.config
+
+        replicated_jobs = [
+            dict(
+                name=_PATHWAYS_HEAD_REPLICATED_JOB_NAME,
+                replicas=cfg.accelerator.num_replicas,
+                template=self._build_pathways_head_job(),
+            ),
+        ]
+
+        for i in range(0, cfg.accelerator.num_replicas):
+            replicated_jobs.append(
+                dict(
+                    name=f"{_PATHWAYS_WORKER_REPLICATED_JOB_NAME}-{i}",
+                    replicas=1,
+                    template=self._build_pathways_worker_job(i),
+                ),
+            )
 
         return replicated_jobs

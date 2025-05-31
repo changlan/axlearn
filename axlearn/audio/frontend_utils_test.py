@@ -35,12 +35,12 @@ from axlearn.audio.frontend_utils import (
     windowing,
 )
 from axlearn.audio.test_utils import fake_audio
-from axlearn.common.test_utils import TestCase, assert_allclose
+from axlearn.common.test_utils import TestCase, assert_allclose, set_threefry_partitionable
 from axlearn.common.utils import as_tensor
 
 
 def _magnitude_spectrogram_from_audio(x, fft_size):
-    return magnitude_spectrogram(jnp.fft.fft(x, n=fft_size), dtype=x.dtype)
+    return magnitude_spectrogram(jnp.fft.rfft(x, n=fft_size), dtype=x.dtype)
 
 
 class FrameTest(parameterized.TestCase, tf.test.TestCase):
@@ -393,6 +393,7 @@ def _ref_log_mel_spectrogram(
 
 
 class ShardedFftTest(TestCase):
+    @set_threefry_partitionable(False)  # TODO(Luzy): update for threefry_partitionable True
     def test_fft(self):
         input_shape = (8, 800, 400)
         fft_size = 512
@@ -413,7 +414,7 @@ class ShardedFftTest(TestCase):
             fft_fn = jax.jit(
                 sharded_fft(n=fft_size, partition_spec=PartitionSpec("data", None, None))
             )
-            ref_ffts = jax.jit(jnp.fft.fft, static_argnames="n")(inputs, n=fft_size)
+            ref_ffts = jax.jit(jnp.fft.rfft, static_argnames="n")(inputs, n=fft_size)
             test_ffts = fft_fn(inputs)
 
         assert_allclose(ref_ffts, test_ffts)
