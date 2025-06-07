@@ -42,6 +42,7 @@ from axlearn.common.param_init import (
     WeightInitializer,
 )
 from axlearn.common.test_utils import TestCase, assert_allclose
+from axlearn.common.utils import safe_not
 
 
 class TestLayer(BaseLayer):
@@ -403,16 +404,16 @@ class BaseLayerTest(TestCase):
         if inline_child_summaries:
             self.assertNestedAllClose(
                 {
-                    "x": {"rms_norm": 9.327524, "max_abs": 26.052944},
-                    "y": {"rms_norm": 9.231870, "max_abs": 26.109497},
+                    "x": {"rms_norm": 9.478282, "max_abs": 26.26252},
+                    "y": {"rms_norm": 9.583241, "max_abs": 25.26252},
                 },
                 output_collections.summaries["tensor_stats"],
             )
         else:
             self.assertNestedAllClose(
                 {
-                    "x": {"norm": {"rms_norm": 9.327524}, "max": {"max_abs": 26.052944}},
-                    "y": {"norm": {"rms_norm": 9.231870}, "max": {"max_abs": 26.109497}},
+                    "x": {"norm": {"rms_norm": 9.478282}, "max": {"max_abs": 26.26252}},
+                    "y": {"norm": {"rms_norm": 9.583241}, "max": {"max_abs": 25.26252}},
                 },
                 output_collections.summaries["tensor_stats"],
             )
@@ -449,14 +450,14 @@ class BaseLayerTest(TestCase):
                 output_collections.summaries["activations/inputs_norm"].weight, batch_size
             )
         else:
-            num_frames = jnp.sum(1 - paddings)
+            num_frames = jnp.sum(safe_not(paddings))
             self.assertEqual(
                 output_collections.summaries["activations/inputs_mean"].weight, num_frames
             )
             self.assertEqual(
                 output_collections.summaries["activations/inputs_norm"].weight, num_frames
             )
-            inputs_with_padding = inputs * (1 - paddings)[:, :, None, None]
+            inputs_with_padding = inputs * safe_not(paddings)[:, :, None, None]
             expected_mean = jnp.sum(inputs_with_padding) / jnp.maximum(1, num_frames) / (2 * 4)
             inputs_norm = jnp.sqrt(jnp.sum(inputs_with_padding**2, axis=(2, 3)) / (2 * 4))
             expected_norm = jnp.sum(inputs_norm) / jnp.maximum(1, num_frames)
