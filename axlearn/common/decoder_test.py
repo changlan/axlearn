@@ -109,13 +109,23 @@ class TestDecoder(TestCase):
 
         # Test values.
         def layer_output(state, layer):
-            return functional(
+            prng_key = jax.random.PRNGKey(2)
+            outputs, _ = functional(
                 layer,
                 inputs=dict(input_batch=dict(input_ids=inputs)),
                 state=state,
                 is_training=False,
-                prng_key=jax.random.PRNGKey(2),
-            )[0]["logits"]
+                prng_key=prng_key,
+            )
+            logits, _ = functional(
+                layer,
+                inputs=dict(forward_outputs=outputs),
+                state=state,
+                is_training=False,
+                prng_key=prng_key,
+                method="compute_logits",
+            )
+            return logits
 
         # Similarities with encoder_decoder_test.
         # pylint: disable=duplicate-code
@@ -198,13 +208,23 @@ class TestDecoder(TestCase):
 
             # Test values.
             def layer_output(state, layer):
-                return functional(
+                prng_key = jax.random.PRNGKey(2)
+                outputs, _ = functional(
                     layer,
                     inputs=dict(input_batch=dict(input_ids=input_ids)),
                     state=state,
                     is_training=False,
-                    prng_key=jax.random.PRNGKey(2),
-                )[0]["logits"]
+                    prng_key=prng_key,
+                )
+                logits, _ = functional(
+                    layer,
+                    inputs=dict(forward_outputs=outputs),
+                    state=state,
+                    is_training=False,
+                    prng_key=prng_key,
+                    method="compute_logits",
+                )
+                return logits
 
             ref_decoder_logits = layer_output(ref_decoder_state, ref_decoder)
             test_decoder_logits = layer_output(test_decoder_state, test_decoder)
@@ -394,6 +414,7 @@ class TestDecoder(TestCase):
                 )
                 * NEG_INF
             )
+        prng_key = jax.random.PRNGKey(0)
         forward_outputs, _ = functional(
             layer,
             inputs=dict(
@@ -407,7 +428,15 @@ class TestDecoder(TestCase):
             ),
             state=layer_params,
             is_training=False,
-            prng_key=jax.random.PRNGKey(0),
+            prng_key=prng_key,
+        )
+        fwd_logits, _ = functional(
+            layer,
+            inputs=dict(forward_outputs=forward_outputs),
+            state=layer_params,
+            is_training=False,
+            prng_key=prng_key,
+            method="compute_logits",
         )
 
         (initial_state, initial_outputs), _ = functional(
@@ -465,7 +494,7 @@ class TestDecoder(TestCase):
 
         # [batch, num_classes, tgt_len] --> [batch, tgt_len, num_classes].
         logits = jnp.moveaxis(logits, -1, -2)
-        assert_allclose(logits, forward_outputs["logits"])
+        assert_allclose(logits, fwd_logits)
 
     @parameterized.product(
         stack_cfg=[
@@ -667,14 +696,12 @@ class TestDecoder(TestCase):
 
     def test_output_logits_modifier(self):
         """Tests the output_logits_modifier config property of `Decoder`."""
-
-        with (
-            unittest.mock.patch.object(
-                causal_lm.Decoder,
-                "_forward_for_mode",
-                lambda *args, **kwargs: (None, dict(logits=5)),
-            ),
-            unittest.mock.patch.object(causal_lm.Decoder, "compute_attention_logit_biases"),
+        prng_key = jax.random.PRNGKey(123)
+        prng_key, init_key, data_key = jax.random.split(prng_key, num=3)
+        logits = jax.random.normal(data_key, [2, 3])
+        temperature = 1 / 17
+        with unittest.mock.patch.object(
+            causal_lm.TransformerTextEmbeddings, "attend", lambda *args, **kwargs: logits
         ):
             decoder_cfg = gpt_decoder_config(
                 stack_cfg=StackedTransformerLayer.default_config(),
@@ -686,14 +713,55 @@ class TestDecoder(TestCase):
                 max_position_embeddings=5,
             )
             output_logits_modifier = config_for_function(logit_modifiers.scale_by).set(
-                temperature=1 / 17
+                temperature=temperature
             )
             decoder_cfg.set(name="tmp", output_logits_modifier=output_logits_modifier)
             decoder = decoder_cfg.instantiate(parent=None)
-            chex.assert_trees_all_close(
-                decoder(input_batch=dict(input_ids=5 * jnp.ones(3))),
-                dict(logits=17 * 5 * jnp.ones(3)),
+            layer_params = decoder.initialize_parameters_recursively(init_key)
+            # Anyway, mock returns the pre-defined logits.
+            dummy_input_ids = jnp.ones([1, 1], jnp.int32)
+
+            # Test forward.
+            outputs, _ = functional(
+                decoder,
+                inputs=dict(input_batch=dict(input_ids=dummy_input_ids)),
+                is_training=True,
+                state=layer_params,
+                prng_key=prng_key,
             )
+            fwd_logits = functional(
+                decoder,
+                inputs=dict(forward_outputs=outputs),
+                is_training=True,
+                prng_key=prng_key,
+                state=layer_params,
+                method="compute_logits",
+            )[0]
+            chex.assert_trees_all_close(fwd_logits, logits / temperature)
+
+            # Test prefill.
+            (cached_states, prefill_outputs), _ = functional(
+                decoder,
+                inputs=dict(
+                    time_step=jnp.ones([1], jnp.int32), input_batch=dict(input_ids=dummy_input_ids)
+                ),
+                state=layer_params,
+                is_training=False,
+                prng_key=prng_key,
+                method="prefill_states",
+            )
+            chex.assert_trees_all_close(prefill_outputs["logits"], logits / temperature)
+
+            # Test extend_step.
+            (_, step_outputs), _ = functional(
+                decoder,
+                inputs=dict(cached_states=cached_states, input_ids=dummy_input_ids),
+                state=layer_params,
+                is_training=False,
+                prng_key=prng_key,
+                method="extend_step",
+            )
+            chex.assert_trees_all_close(step_outputs["logits"], logits / temperature)
 
     def test_token_scores_match_between_decoded_and_prefix(self):
         """Test that token scores match between sample_decode passes.

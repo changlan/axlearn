@@ -10,7 +10,6 @@
 
 import enum
 import math
-from functools import partial
 from typing import Callable, Union
 
 import jax
@@ -21,7 +20,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from numpy.typing import ArrayLike
 
-from axlearn.common import einops
+from axlearn.common import ein_ops
 from axlearn.common.utils import Tensor
 
 
@@ -193,7 +192,7 @@ def frame(x: Tensor, *, frame_size: int, hop_size: int, pad_value: int = 0) -> T
         idx = hop_size * jnp.arange(output_size)[:, None] + jnp.arange(frame_size)[None, :]
         frame_x = x[..., idx]
     else:
-        chunk_x = einops.rearrange(x, "b (t c) -> b t c", c=chunk_size)
+        chunk_x = ein_ops.rearrange(x, "b (t c) -> b t c", c=chunk_size)
         num_chunk = chunk_x.shape[1]
 
         frame_ratio = frame_size // chunk_size
@@ -203,7 +202,7 @@ def frame(x: Tensor, *, frame_size: int, hop_size: int, pad_value: int = 0) -> T
         in_frame_indices = jnp.arange(frame_ratio)[jnp.newaxis, :]
         out_frame_indices = (jnp.arange(output_size) * hop_ratio)[:, jnp.newaxis]
         frame_x = chunk_x[:, out_frame_indices + in_frame_indices, :]
-        frame_x = einops.rearrange(
+        frame_x = ein_ops.rearrange(
             frame_x, "b ow iw c-> b ow (iw c)", ow=output_size, iw=frame_ratio, c=chunk_size
         )
     return jnp.reshape(frame_x, (*orig_shape[:-1], *frame_x.shape[-2:]))  # Restore orig_shape[:-1].
@@ -293,15 +292,13 @@ def magnitude_spectrogram(ffts: Tensor, *, dtype: jnp.dtype) -> Tensor:
     """Computes magnitude of the spectrogram from the FFT matrix.
 
     Args:
-        ffts: FFT of input audio frames of shape `[..., num_frames, fft_size]`.
+        ffts: FFT of input audio frames of shape `[..., num_frames, fft_size // 2 + 1]`.
         dtype: dtype of output tensor.
 
     Returns:
-        A spectrogram of shape `[..., num_frames, num_spectrogram_bins=fft_size // 2 + 1]`.
+        A spectrogram of shape `[..., num_frames, fft_size // 2 + 1]`.
     """
     out = jnp.abs(ffts)
-    fft_size = ffts.shape[-1]
-    out = out[..., : fft_size // 2 + 1]
     return out.astype(dtype)
 
 
@@ -406,8 +403,25 @@ def sharded_fft(n: int, partition_spec: PartitionSpec) -> Callable[[Tensor], Ten
         A callable that computes FFT.
     """
     return shard_map(
-        partial(jnp.fft.fft, n=n),
+        lambda x: jnp.fft.rfft(cast_for_rfft(x), n=n),
         mesh=thread_resources.env.physical_mesh,
         in_specs=partition_spec,
         out_specs=partition_spec,
     )
+
+
+def cast_for_rfft(x: Tensor) -> Tensor:
+    """Casts the input tensor to a valid dtype for jnp.fft.rfft if necessary.
+
+    jnp.fft.rfft requires the input to be of dtype float32 or float64.
+
+    Args:
+        x: Input tensor of arbitrary dtype.
+
+    Returns:
+        A tensor of dtype float32 or float64, suitable for jnp.fft.rfft.
+    """
+    if x.dtype in (jnp.float32, jnp.float64):
+        return x
+    else:
+        return x.astype(jnp.float32)

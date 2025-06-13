@@ -3,6 +3,9 @@
 """Tests TPU FlashAttention kernels."""
 from __future__ import annotations
 
+from contextlib import nullcontext
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -123,7 +126,12 @@ class TestFlashAttention(TestCase):
         mask=[None, causal_mask, jax_fn_mask(5)],
         attention_bias_type=[None, "2d", "4d"],
         with_segment_ids=[False, True],
-        per_head_dim=[32, 64, 128, 256],
+        per_head_dim=[32, 64, 128],
+        q_dtype=[jnp.float32, jnp.bfloat16],
+        kv_dtype=[jnp.float32, jnp.bfloat16],
+        matmul_precision=[None, "highest"],
+        dropout_rate=[0.0, 0.1, 0.2],
+        head_group_size=[2, 1],
     )
     def test_forward_and_backward(
         self,
@@ -135,48 +143,94 @@ class TestFlashAttention(TestCase):
         mask,
         attention_bias_type,
         with_segment_ids,
+        q_dtype,
+        kv_dtype,
+        matmul_precision,
+        dropout_rate,
+        head_group_size,
     ):
         if jax.default_backend() == "cpu":
             # TODO(dhwang2): this has been broken for a while on CPU.
             pytest.skip(reason="Backward path is broken on CPU")
         if mask not in (None, causal_mask) and query_length_multiplier > 1:
             pytest.skip(reason="Sliding window attention does not make sense when q_len != kv_len.")
+        if kv_dtype == jnp.float32 and q_dtype == jnp.bfloat16:
+            pytest.skip(reason="KV should not have a higher precision than Q.")
+        if dropout_rate > 0.0 and (attention_bias_type is not None or per_head_dim % 128 != 0):
+            pytest.skip(
+                reason="Dropout is only supported with SplashAttention (which requires \
+                            no bias, and per_head_dim being a multiple of 128.)"
+            )
         # pylint: disable=protected-access
         fallback_to_legacy = per_head_dim % 128 != 0 or (attention_bias_type is not None)
+        num_kv_heads = num_heads // head_group_size
         q, k, v, bias = generate_attention_data(
             batch_size,
             int(kv_len * query_length_multiplier),
             kv_len,
             num_heads,
             per_head_dim,
+            num_kv_heads,
             mask_fn=mask,
             attention_bias_type=attention_bias_type,
             with_segment_ids=with_segment_ids,
+            dtype=q_dtype,
+            kv_dtype=kv_dtype,
         )
+        tpu_block_size = 128
         cfg = dict(
             interpret=jax.default_backend() == "cpu",
             softmax_scale=per_head_dim**-0.5,
-            tpu_block_size=128,
+            tpu_block_size=tpu_block_size,
+            dropout_rate=dropout_rate,
         )
         ref_fn = ReferenceMHA.default_config().set(**cfg).instantiate()
         fn = tpu_attention.TPUSplashAttention.default_config().set(**cfg).instantiate()
-        if not fn.is_supported(query=q, key=k, value=v, bias=bias):
-            # Check splash attention is used when it should be.
-            self.assertEqual(fallback_to_legacy, True)
-            fn = tpu_attention.LegacyTPUFlashAttention.default_config().set(**cfg).instantiate()
-            self.assertEqual(fn.is_supported(query=q, key=k, value=v, bias=bias), True)
-
-        # Compare outputs.
-        out = fn(q, k, v, bias)
-        ref_out = ref_fn(q, k, v, bias)
-        self.assertNestedAllClose(out, ref_out, atol=0.05)
-
-        # Compare grads.
-        grad_out = jax.grad(lambda *args: fn(*args).mean(), argnums=(0, 1, 2))(q, k, v, bias)
-        ref_grad_out = jax.grad(lambda *args: ref_fn(*args).mean(), argnums=(0, 1, 2))(
-            q, k, v, bias
+        prng_key = jax.random.PRNGKey(66)
+        input_batch = dict(
+            query=q,
+            key=k,
+            value=v,
+            bias=bias,
+            prng_key=prng_key,
         )
-        self.assertNestedAllClose(grad_out, ref_grad_out, atol=0.05)
+
+        with jax.default_matmul_precision(matmul_precision) if matmul_precision else nullcontext():
+            err = matmul_precision == "highest" and q_dtype == jnp.bfloat16
+            with self.assertRaises(ValueError) if err else nullcontext():
+                is_supported = fn.is_supported(input_batch=input_batch)
+            if err:
+                return
+
+            if not is_supported:
+                # Check splash attention is used when it should be.
+                self.assertEqual(fallback_to_legacy, True)
+                fn = tpu_attention.LegacyTPUFlashAttention.default_config().set(**cfg).instantiate()
+                legacy_supported = fn.is_supported(input_batch=input_batch)
+                if q_dtype != kv_dtype:
+                    self.assertEqual(legacy_supported, False)
+                    return
+                self.assertEqual(legacy_supported, True)
+
+            # Compare outputs.
+            out = fn(input_batch)
+            if dropout_rate > 0.0:
+                # Get the dropout mask from pallas function as the reference.
+                dropout_mask = fn.get_dropout_mask(input_batch)
+                ref_fn = partial(ref_fn, dropout_mask=dropout_mask)
+            ref_out = ref_fn(input_batch)
+            self.assertNestedAllClose(out, ref_out, atol=0.05)
+
+            # Compare grads.
+            def grad_fn(float_inputs, aux_inputs, f):
+                full_batch = {**float_inputs, **aux_inputs}
+                return f(full_batch).mean()
+
+            float_inputs = dict(query=q, key=k, value=v)
+            aux_inputs = dict(bias=bias, prng_key=prng_key)
+            grad_out = jax.grad(grad_fn, argnums=0)(float_inputs, aux_inputs, fn)
+            ref_grad_out = jax.grad(grad_fn, argnums=0)(float_inputs, aux_inputs, ref_fn)
+            self.assertNestedAllClose(grad_out, ref_grad_out, atol=0.05)
 
 
 if __name__ == "__main__":

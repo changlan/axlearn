@@ -177,6 +177,7 @@ def propagate_repeated_output_collections(
     *,
     child_name_prefix: str,
     target_output_collection: OutputCollection,
+    merge_summaries: bool,
 ):
     """Propagates contents from `repeated_output_collection` to `target_target_output_collection`.
 
@@ -192,6 +193,9 @@ def propagate_repeated_output_collections(
         child_name_prefix: The child name prefix used for children to be added to
             `target_output_collection`.
         target_output_collection: The target OutputCollection.
+        merge_summaries: Whether to merge summaries or not. If set to True, summaries from the loop
+            will be merged into "iter", rather than being stored separately per iteration like
+            "iter0", "iter1", etc.
     """
     # Fill `target_output_collection[child_name_prefix]` with `repeated_output_collection`.
     child_output = target_output_collection.add_child(child_name_prefix)
@@ -207,11 +211,28 @@ def propagate_repeated_output_collections(
         first_summary_value = summary_values[0]
         assert first_summary_value.shape, "Stacked summaries should have a leading stack dimension."
         num_children = first_summary_value.shape[0]
-        for i in range(num_children):
-            child_i_output = target_output_collection.add_child(f"{child_name_prefix}{i}")
-            child_i_output.summaries.update(
-                jax.tree.map(lambda x, i=i: x[i], repeated_output_collection.summaries)
-            )
+        if merge_summaries:
+            summaries_list = []
+            for i in range(num_children):
+                summaries_list.append(
+                    jax.tree.map(lambda x, i=i: x[i], repeated_output_collection.summaries)
+                )
+
+            summaries_0th = summaries_list[0]
+            for i in range(1, num_children):
+                summaries_0th = jax.tree.map(
+                    lambda x, y: x.accumulate(y),
+                    summaries_0th,
+                    summaries_list[i],
+                    is_leaf=lambda x: isinstance(x, Summary),
+                )
+            child_output.summaries.update(**summaries_0th)
+        else:
+            for i in range(num_children):
+                child_i_output = target_output_collection.add_child(f"{child_name_prefix}{i}")
+                child_i_output.summaries.update(
+                    jax.tree.map(lambda x, i=i: x[i], repeated_output_collection.summaries)
+                )
 
 
 T = TypeVar("T")
@@ -1108,6 +1129,8 @@ def scan_in_context(
     drop_output: Optional[Callable[[str], bool]] = None,
     child_name_prefix: str = "iter",
     unroll: Union[int, bool] = 1,
+    remat_kwargs: Optional[dict[str, Any]] = None,
+    merge_summaries: bool = False,
 ) -> tuple[NestedTensor, NestedTensor]:
     """A thin wrapper around `jax.lax.scan` which is compatible with `OutputCollection`.
 
@@ -1133,6 +1156,20 @@ def scan_in_context(
             to run within a single rolled iteration of the loop. If a boolean is provided, it will
             determine if the loop is competely unrolled (i.e. unroll=True) or left completely rolled
             (i.e. unroll=False).
+        remat_kwargs: Optional dict passed to `jax.checkpoint` to enable rematerialization.
+            Common options include:
+              - `prevent_cse`: (bool) Whether to disable common subexpression elimination.
+                    If left unspecified, defaults to False following recommendations from the JAX
+                    documentation.
+                    Raises a ValueError if `prevent_cse` is set to True.
+              - `policy`: A checkpoint policy from `jax.checkpoint_policies`.
+            If provided, the scan body will be wrapped as:
+                `scan_fn = jax.checkpoint(scan_fn, **remat_kwargs)`
+            Otherwise, `jax.checkpoint` is not used.
+            See https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html.
+        merge_summaries: Whether to merge summaries or not. If set to True, summaries from the loop
+            will be merged into "iter", rather than being stored separately per iteration like
+            "iter0", "iter1", etc.
 
     Returns:
         The scan outputs (carry, ys):
@@ -1141,6 +1178,9 @@ def scan_in_context(
             - ys: A NestedTensor with tensor leaves T of shape [num_scan_iters, ...], with T[i, ...]
                 representing the `fn` outputs and output collection of the ith scan iteration,
                 respesctively.
+
+    Raises:
+        ValueError: If `current_context()` is None, or if invalid remat_kwargs are passed.
     """
 
     ctx = current_context()
@@ -1171,11 +1211,22 @@ def scan_in_context(
 
         return carry_i, dict(y_i=y_i, output_collection=output_collection_i)
 
+    if remat_kwargs is not None:
+        if "prevent_cse" in remat_kwargs:
+            if remat_kwargs["prevent_cse"]:
+                raise ValueError(
+                    "`prevent_cse=True` is not recommended inside `jax.checkpoint` over `scan`."
+                    "Set `prevent_cse=False` or omit the flag entirely."
+                )
+        else:
+            remat_kwargs["prevent_cse"] = False
+        scan_fn = jax.checkpoint(scan_fn, **remat_kwargs)
     carry, scan_ys = jax.lax.scan(scan_fn, init=carry, xs=xs, unroll=unroll)
     propagate_repeated_output_collections(
         scan_ys.pop("output_collection"),
         child_name_prefix=child_name_prefix,
         target_output_collection=ctx.output_collection,
+        merge_summaries=merge_summaries,
     )
 
     return carry, scan_ys["y_i"]

@@ -82,7 +82,7 @@ from axlearn.common.param_init import PARAM_REGEXP_WEIGHT, WeightInitializer
 from axlearn.common.poolings import AttentionPooling as AxlearnAttentionPooling
 from axlearn.common.poolings import AveragePooling as AxlearnAveragePooling
 from axlearn.common.poolings import FirstNTokenPooling as AxlearnFirstNTokenPooling
-from axlearn.common.test_utils import TestCase
+from axlearn.common.test_utils import TestCase, set_threefry_partitionable
 from axlearn.common.utils import flatten_items
 from axlearn.common.vision_transformer import named_model_configs as axlearn_vit_configs
 from axlearn.vision.coca import set_coca_vision_encoder_config
@@ -913,6 +913,7 @@ class TransformerEmbeddingsTest(TestCase):
 
 
 class DecoderTest(TestCase):
+    @set_threefry_partitionable(False)  # TODO(markblee): update for threefry_partitionable True
     def test_decoder_inference(self):
         vocab_size = 13
         emb_dim = 8
@@ -979,12 +980,18 @@ class DecoderTest(TestCase):
             is_training=False,
             method="forward",
         )[0]
+        axlearn_logits = F(
+            axlearn_layer,
+            jax.random.PRNGKey(0),
+            state=axlearn_layer_state,
+            inputs=dict(forward_outputs=axlearn_outputs),
+            is_training=False,
+            method="compute_logits",
+        )[0]
         self.assertNestedAllClose(
             torch_outputs["hidden_states"].detach().numpy(), axlearn_outputs["hidden_states"]
         )
-        self.assertNestedAllClose(
-            torch_outputs["logits"].detach().numpy(), axlearn_outputs["logits"]
-        )
+        self.assertNestedAllClose(torch_outputs["logits"].detach().numpy(), axlearn_logits)
         # Also test extend.
         for chunk_size in [1, 6]:
             extend_logits: torch.Tensor = None
@@ -1244,12 +1251,18 @@ class CausalLmModelModulesTest(TestCase):
             torch_input_ids, target_labels=torch.as_tensor(target_labels)
         )
         self.assertNestedAllClose(
-            torch_predictions["logits"].detach().numpy(), axlearn_predictions["logits"]
-        )
-        self.assertNestedAllClose(
             torch_predictions["hidden_states"].detach().numpy(),
             axlearn_predictions["hidden_states"],
         )
+        axlearn_logits = F(
+            axlearn_model,
+            jax.random.PRNGKey(0),
+            state=axlearn_model_state,
+            inputs=dict(predictions=axlearn_predictions),
+            is_training=False,
+            method="compute_logits",
+        )[0]
+        self.assertNestedAllClose(torch_predictions["logits"].detach().numpy(), axlearn_logits)
         # Also test iterative decoding.
         extend_logits: torch.Tensor = None
         extend_hidden_states: torch.Tensor = None
@@ -1321,12 +1334,18 @@ class AdapterCausalLmModelModulesTest(TestCase):
             torch_input_ids, target_labels=torch.as_tensor(target_labels)
         )
         self.assertNestedAllClose(
-            torch_predictions["logits"].detach().numpy(), axlearn_predictions["logits"]
-        )
-        self.assertNestedAllClose(
             torch_predictions["hidden_states"].detach().numpy(),
             axlearn_predictions["hidden_states"],
         )
+        axlearn_logits = F(
+            axlearn_model,
+            jax.random.PRNGKey(0),
+            state=axlearn_model_state,
+            inputs=dict(predictions=axlearn_predictions),
+            is_training=False,
+            method="compute_logits",
+        )[0]
+        self.assertNestedAllClose(torch_predictions["logits"].detach().numpy(), axlearn_logits)
         # Also test iterative decoding.
         extend_logits: torch.Tensor = None
         extend_hidden_states: torch.Tensor = None

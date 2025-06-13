@@ -28,11 +28,9 @@ from jax.experimental.pallas.ops.tpu.flash_attention import (
     below_or_on_diag,
 )
 from jax.experimental.pallas.ops.tpu.splash_attention import SegmentIds as SplashSegmentIds
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-    splash_attention_kernel,
-    splash_attention_mask,
-)
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
+import axlearn.common.flash_attention.tpu_splash_attention as splash_attention_kernel
 from axlearn.common.attention_bias import (
     BaseAttentionBias,
     CausalAttentionBias,
@@ -48,7 +46,7 @@ from axlearn.common.flash_attention.common import (
     repeat_kv_heads,
 )
 from axlearn.common.flash_attention.remat import FLASH_ATTN_RESIDUAL_NAME
-from axlearn.common.utils import Tensor
+from axlearn.common.utils import Nested, Tensor
 
 MaskFnOrZero = MaskFnAttentionBias | ZeroAttentionBias
 
@@ -863,16 +861,25 @@ class TPUFlashAttention(BaseFlashAttention):
     """Wraps the common checks for TPU attention implementations."""
 
     def is_supported(
-        self, *, query: Tensor, key: Tensor, value: Tensor, bias: BaseAttentionBias
+        self,
+        input_batch: Nested[Tensor | BaseAttentionBias],
     ) -> bool:
         """See `BaseFlashAttention.is_supported`."""
-        if not super().is_supported(query=query, key=key, value=value, bias=bias):
+        if not super().is_supported(
+            input_batch=input_batch,
+        ):
             return False
         block_size = self.cfg.tpu_block_size
-        if not self._check_block_size(query=query, key=key, block_size=block_size):
+        if not self._check_block_size(input_batch=input_batch, block_size=block_size):
             return False
-        if self.cfg.dropout_rate != 0.0:
-            return self._log_unsupported("dropout is not supported.")
+        query: Tensor = input_batch["query"]
+        if jax.config.jax_default_matmul_precision == "highest" and query.dtype == jnp.bfloat16:
+            # Pallas is having some trouble compiling bfloat with precision default is the highest
+            # precision.
+            raise ValueError(
+                "TPU FlashAttention doesn't support default_matmul_precision=='highest' "
+                "when the query dtype is bfloat16!"
+            )
         return True
 
 
@@ -887,12 +894,15 @@ class TPUSplashAttention(TPUFlashAttention):
     """
 
     def is_supported(
-        self, *, query: Tensor, key: Tensor, value: Tensor, bias: BaseAttentionBias
+        self,
+        input_batch: Nested[Tensor | BaseAttentionBias],
     ) -> bool:
         """See `BaseFlashAttention.is_supported`."""
-        if not super().is_supported(query=query, key=key, value=value, bias=bias):
+        if not super().is_supported(input_batch):
             return False
+        bias: BaseAttentionBias = input_batch["bias"]
         _, _, explicit_bias = split(bias, MaskFnAttentionBias, SegmentIdAttentionBias)
+        query: Tensor = input_batch["query"]
         head_dim = query.shape[-1]
 
         if explicit_bias.has_value():
@@ -908,14 +918,21 @@ class TPUSplashAttention(TPUFlashAttention):
     @functools.partial(jax.jit, static_argnames=["self"])
     def __call__(
         self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        bias: BaseAttentionBias,
-        prng_key: Optional[Tensor] = None,
+        input_batch: Nested[Tensor | BaseAttentionBias],
     ) -> Tensor:
         """See `BaseFlashAttention.__call__`."""
-        del prng_key
+        cfg = self.config
+        bias: BaseAttentionBias = input_batch["bias"]
+        query: Tensor = input_batch["query"]
+        key: Tensor = input_batch["key"]
+        value: Tensor = input_batch["value"]
+        prng_key = input_batch.get("prng_key", None)
+
+        if cfg.dropout_rate > 0.0 and prng_key is None:
+            raise ValueError(
+                "TPU SplashAttention requires a prng_key to be provided when dropout is enabled."
+            )
+
         mask, segment_ids, _ = split(bias, MaskFnAttentionBias, SegmentIdAttentionBias)
         segment_id_tensor = get_segment_ids(query=query, key=key, segment_ids=segment_ids)
         seg_ids = None
@@ -941,47 +958,101 @@ class TPUSplashAttention(TPUFlashAttention):
             use_fused_bwd_kernel=True,
         )
         splash_mask = _to_splash_mask(mask, mask_shape=(query.shape[2], key.shape[2]))
+
+        num_heads = query.shape[1]
+        mha_mask = splash_attention_mask.MultiHeadMask(masks=[splash_mask] * num_heads)
+
         num_heads = query.shape[1]
         kernel = splash_attention_kernel.make_splash_mha(
-            mask=splash_attention_mask.MultiHeadMask(masks=[splash_mask] * num_heads),
+            mask=mha_mask,
             block_sizes=block_sizes,
             # TODO(dhwang2): support "seq" and "model" shard.
             head_shards=1,
             q_seq_shards=1,
+            dropout_rate=cfg.dropout_rate,
             interpret=self.cfg.interpret,
             residual_checkpoint_name=f"tpu_attention.{FLASH_ATTN_RESIDUAL_NAME}",
         )
-        kernel = jax.vmap(kernel)
-        context = kernel(q=query, k=key, v=value, segment_ids=seg_ids)
+        p_kernel = functools.partial(kernel, prng_key=prng_key)
+        vp_kernel = jax.vmap(p_kernel, axis_name="batch")
+        context = vp_kernel(q=query, k=key, v=value, segment_ids=seg_ids)
         return jnp.einsum("bnth->btnh", context)
+
+    def get_dropout_mask(
+        self,
+        input_batch: Nested[Tensor | BaseAttentionBias],
+    ) -> Tensor:
+        """Auxiliary function to get the dropout mask for debugging purposes.
+        It will return a boolean dropout mask of shape [batch, num_heads, seq_len, seq_len].
+        """
+        cfg = self.config
+        query: Tensor = input_batch["query"]
+        key: Tensor = input_batch["key"]
+        prng_key = input_batch.get("prng_key", None)
+
+        if cfg.dropout_rate > 0.0 and prng_key is None:
+            raise ValueError(
+                "TPU SplashAttention requires a prng_key to be provided when dropout is enabled."
+            )
+
+        # Switch num_heads and seq_len axes.
+        query = jnp.einsum("btnh->bnth", query) * self.cfg.softmax_scale
+        key = jnp.einsum("bsnh->bnsh", key)
+
+        block_size = self.cfg.tpu_block_size
+        block_sizes = splash_attention_kernel.BlockSizes(
+            block_q=block_size,
+            block_kv=block_size,
+            block_kv_compute=block_size,
+            block_q_dkv=block_size,
+            block_kv_dkv=block_size,
+            block_kv_dkv_compute=block_size,
+            use_fused_bwd_kernel=True,
+        )
+
+        kernel = functools.partial(
+            splash_attention_kernel.get_dropout_mask,
+            prng_key=prng_key,
+            block_sizes=block_sizes,
+            dropout_rate=cfg.dropout_rate,
+        )
+        v_kernel = jax.vmap(kernel, axis_name="batch")
+        dropout_mask = v_kernel(query, key)
+        return dropout_mask
 
 
 class LegacyTPUFlashAttention(TPUFlashAttention):
     """Wraps the legacy (deprecated) implementation of TPU attention."""
 
     def is_supported(
-        self, *, query: Tensor, key: Tensor, value: Tensor, bias: BaseAttentionBias
+        self,
+        input_batch: Nested[Tensor | BaseAttentionBias],
     ) -> bool:
         """See `BaseFlashAttention.is_supported`."""
-        if not super().is_supported(query=query, key=key, value=value, bias=bias):
+        if not super().is_supported(input_batch):
             return False
+        query: Tensor = input_batch["query"]
+        key: Tensor = input_batch["key"]
+        if query.dtype != key.dtype:
+            return self._log_unsupported(f"{query.dtype=} != {key.dtype=}")
+        if self.cfg.dropout_rate != 0.0:
+            return self._log_unsupported("dropout is not supported.")
         logging.info("Using %s.", self.name())
         return True
 
     @functools.partial(jax.jit, static_argnames=["self"])
     def __call__(
         self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        bias: BaseAttentionBias,
-        prng_key: Optional[Tensor] = None,
+        input_batch: Nested[Tensor | BaseAttentionBias],
     ) -> Tensor:
         """See `BaseFlashAttention.__call__`."""
-        del prng_key
+        bias: BaseAttentionBias = input_batch["bias"]
         causal_mask, segment_ids, explicit_bias = split(
             bias, CausalAttentionBias, SegmentIdAttentionBias
         )
+        query: Tensor = input_batch["query"]
+        key: Tensor = input_batch["key"]
+        value: Tensor = input_batch["value"]
         segment_id_tensor = get_segment_ids(query=query, key=key, segment_ids=segment_ids)
         seg_ids = None
         if segment_id_tensor is not None:

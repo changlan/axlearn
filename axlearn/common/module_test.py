@@ -904,13 +904,17 @@ class ScanInContextTest(TestWithTemporaryCWD):
         num_iters = 3
 
         # Invoke with inherited state. In this case, the same state is used each iter.
-        with self._dummy_context():
+        with self._dummy_context() as ctx:
             carry, ys = self._invoke(num_iters=num_iters, xs={})
             self.assertNestedEqual(jnp.array([num_iters], dtype=carry.dtype), carry)
             self.assertNestedEqual(
                 jnp.array([[0, 10], [2, 12], [4, 14]], dtype=carry.dtype),
                 ys,
             )
+            for collection in ctx.output_collection:
+                self.assertIn("iter", collection)
+                for i in range(num_iters):
+                    self.assertIn(f"iter{i}", collection)
 
         # Invoke with explicit state. In this case, the state is unrolled.
         with self._dummy_context():
@@ -923,6 +927,19 @@ class ScanInContextTest(TestWithTemporaryCWD):
                 jnp.array([[10, 10], [12, 12], [14, 14]], dtype=carry.dtype),
                 ys,
             )
+
+        # Invoke with merge_summaries=True.
+        with self._dummy_context() as ctx:
+            carry, ys = self._invoke(num_iters=num_iters, xs={}, merge_summaries=True)
+            self.assertNestedEqual(jnp.array([num_iters], dtype=carry.dtype), carry)
+            self.assertNestedEqual(
+                jnp.array([[0, 10], [2, 12], [4, 14]], dtype=carry.dtype),
+                ys,
+            )
+            for collection in ctx.output_collection:
+                self.assertIn("iter", collection)
+                for i in range(num_iters):
+                    self.assertNotIn(f"iter{i}", collection)
 
     def test_drop_output(self):
         num_iters = 3
@@ -991,6 +1008,29 @@ class ScanInContextTest(TestWithTemporaryCWD):
                     },
                 },
                 ctx.output_collection.module_outputs[child_name_prefix]["nested"],
+            )
+
+    def test_remat(self):
+        num_iters = 3
+
+        with self._dummy_context():
+            ref_carry, ref_ys = self._invoke(num_iters=num_iters, xs={})
+
+        with self._dummy_context():
+            test_carry, test_ys = self._invoke(
+                num_iters=num_iters,
+                xs={},
+                remat_kwargs=dict(policy=jax.checkpoint_policies.everything_saveable),
+            )
+        self.assertNestedEqual(ref_carry, test_carry)
+        self.assertNestedEqual(ref_ys, test_ys)
+
+        # prevent_cse=True raises ValueError.
+        with self._dummy_context(), self.assertRaises(ValueError):
+            _ = self._invoke(
+                num_iters=num_iters,
+                xs={},
+                remat_kwargs=dict(prevent_cse=True),
             )
 
 

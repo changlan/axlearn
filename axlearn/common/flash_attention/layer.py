@@ -41,11 +41,6 @@ class FlashAttention(GroupedQueryAttention):
     class Config(GroupedQueryAttention.Config):
         """Configures FlashAttention."""
 
-        # Deprecated. Use `mask=causal_mask` instead.
-        # If True, applies additional optimizations in the FlashAttention kernels.
-        # Causal attention can still be used when False, by passing logit biases.
-        # TODO (apghml) remove this in favor of `mask`.
-        causal: bool = False
         # The block size used to tile attention computation (for TPU only).
         # Should be less than the target sequence length and a multiple of 128 on TPU.
         # TODO(tom_gunter): Expose GPU block-size (currently always 128) & unify.
@@ -219,10 +214,6 @@ class FlashAttention(GroupedQueryAttention):
             attention_logit_biases, attention_logit_biases_spec
         )
 
-        # Scale query and key.
-        q_proj = self.scale_query(q_proj)
-        k_proj = self.scale_key(k_proj)
-
         # Constrain input to conform to partitioned MHA expectations.
         q_proj = with_sharding_constraint(q_proj, cfg.mha_dim_to_partition_spec["btnh"])
         k_proj = with_sharding_constraint(k_proj, cfg.mha_dim_to_partition_spec["bsnh"])
@@ -230,21 +221,22 @@ class FlashAttention(GroupedQueryAttention):
 
         # We need to manually partition pallas | jax-triton calls.
         # Note: shard_map doesn't support kwargs.
+        input_batch_specs = {
+            # Q [batch_size, seq_len, num_heads, per_head_dim].
+            "query": cfg.mha_dim_to_partition_spec["btnh"],
+            # KV [batch_size, seq_len, repeated_num_heads, per_head_dim].
+            # repeated_num_heads should be divided evenly by the n axis.
+            "key": cfg.mha_dim_to_partition_spec["bsnh"],
+            "value": cfg.mha_dim_to_partition_spec["bsnh"],
+            # PRNG Key
+            "prng_key": PartitionSpec(None),
+            # Bias that can broadcast to [batch_size, num_heads, seq_len, seq_len].
+            "bias": attention_logit_biases_spec,
+        }
         partitioned_mha = shard_map(
             jit_attn,
             mesh=thread_resources.env.physical_mesh,
-            in_specs=(
-                # Q [batch_size, seq_len, num_heads, per_head_dim].
-                cfg.mha_dim_to_partition_spec["btnh"],
-                # KV [batch_size, seq_len, repeated_num_heads, per_head_dim].
-                # repeated_num_heads should be divided evenly by the n axis.
-                cfg.mha_dim_to_partition_spec["bsnh"],
-                cfg.mha_dim_to_partition_spec["bsnh"],
-                # Bias that can broadcast to [batch_size, num_heads, seq_len, seq_len].
-                attention_logit_biases_spec,
-                # PRNG Key.
-                PartitionSpec(None),
-            ),
+            in_specs=(input_batch_specs,),
             # O [batch_size, seq_len, num_heads, per_head_dim].
             out_specs=cfg.mha_dim_to_partition_spec["btnh"],
             # Disables a checking pass which jax can't apply when there's a triton | pallas
@@ -252,15 +244,18 @@ class FlashAttention(GroupedQueryAttention):
             check_rep=False,
         )
 
+        # Note: we use dropout layer's prng_key so the dropout result is identical to
+        # using self.dropout.forward because we will produce identical mask.
+        input_batch = {
+            "query": q_proj,
+            "key": k_proj,
+            "value": v_proj,
+            "prng_key": self.dropout.get_prng_key(),
+            "bias": attention_logit_biases,
+        }
         outputs = with_sharding_constraint(
             partitioned_mha(
-                # Note: we use dropout layer's prng_key so the dropout result is identical to
-                # using self.dropout.forward because we will produce identical mask.
-                q_proj,
-                k_proj,
-                v_proj,
-                attention_logit_biases,
-                self.dropout.get_prng_key(),
+                input_batch,
             ),
             cfg.output_dim_to_partition_spec["btnh"],
         )

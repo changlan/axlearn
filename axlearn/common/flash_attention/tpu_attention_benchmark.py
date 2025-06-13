@@ -33,7 +33,10 @@ import jax
 
 from axlearn.common.attention_bias import causal_mask
 from axlearn.common.flash_attention.common import ReferenceMHA
-from axlearn.common.flash_attention.test_utils import generate_attention_data
+from axlearn.common.flash_attention.test_utils import (
+    generate_attention_data,
+    generate_paged_attention_data,
+)
 from axlearn.common.flash_attention.utils import flash_attention_implementation
 
 _BENCHMARK_CONFIGS = {
@@ -92,6 +95,7 @@ def _benchmark(
     causal: bool = True,
     use_bias: bool = False,
     sliding_window_size: Optional[int] = None,
+    page_size: Optional[int] = None,
 ):
     """Benchmarks TPU FlashAttention vs reference impl."""
     q, k, v, bias = generate_attention_data(
@@ -106,6 +110,23 @@ def _benchmark(
         attention_bias_type="4d" if use_bias else None,
         query_offset=seq_len - 1 if is_decoding else 0,
     )
+    page_tables = None
+    if page_size is not None:
+        assert is_decoding
+        q, k, v, page_tables, bias = generate_paged_attention_data(
+            batch_size=batch_size,
+            query_len=1,
+            kv_len=seq_len,
+            num_heads=num_heads,
+            per_head_dim=per_head_dim,
+            page_size=page_size,
+            num_kv_heads=num_kv_heads or num_heads,
+            mask_fn=causal_mask if causal and not sliding_window_size else None,
+            sliding_window_sz=sliding_window_size,
+            attention_bias_type="4d" if use_bias else None,
+            query_offset=seq_len - 1,
+        )
+
     softmax_scale = q.shape[-1] ** 0.5
     # Get fwd & bwd timing information when softmax scaling applied before calling the kernel.
     ref_mha_impl = (
@@ -122,20 +143,29 @@ def _benchmark(
         softmax_scale=softmax_scale,
         tpu_block_size=block_size,
         is_decoding=is_decoding,
+        page_tables=page_tables,
     )
 
-    ref_fwd_time = _time_call(lambda: ref_mha_impl(q, k, v, bias))
-    flash_fwd_time = _time_call(lambda: mha_impl(q, k, v, bias))
+    input_batch = dict(query=q, key=k, value=v, bias=bias, page_tables=page_tables)
+    ref_fwd_time = _time_call(lambda: ref_mha_impl(input_batch))
+    flash_fwd_time = _time_call(lambda: mha_impl(input_batch))
 
     if not is_decoding:
-        flash_grad_fn = jax.jit(
-            jax.grad(lambda q, k, v, b: ref_mha_impl(q, k, v, b).mean(), argnums=(0, 1, 2))
-        )
-        ref_bwd_time = _time_call(lambda: flash_grad_fn(q, k, v, bias)[0])
-        flash_grad_fn = jax.jit(
-            jax.grad(lambda q, k, v, b: mha_impl(q, k, v, b).mean(), argnums=(0, 1, 2))
-        )
-        flash_bwd_time = _time_call(lambda: flash_grad_fn(q, k, v, bias)[0])
+
+        def grad_ref(float_inputs, aux_inputs):
+            full_batch = {**float_inputs, **aux_inputs}
+            return ref_mha_impl(full_batch).mean()
+
+        def grad_test(float_inputs, aux_inputs):
+            full_batch = {**float_inputs, **aux_inputs}
+            return mha_impl(full_batch).mean()
+
+        float_inputs = dict(query=q, key=k, value=v)
+        aux_inputs = dict(bias=bias)
+        ref_grad_fn = jax.jit(jax.grad(grad_ref, argnums=0))
+        ref_bwd_time = _time_call(lambda: ref_grad_fn(float_inputs, aux_inputs)["query"])
+        flash_grad_fn = jax.jit(jax.grad(grad_test, argnums=0))
+        flash_bwd_time = _time_call(lambda: flash_grad_fn(float_inputs, aux_inputs)["query"])
 
     print(f"ref_fwd:{ref_fwd_time:.4f}s, flash_fwd:{flash_fwd_time:.4f}s")
     if not is_decoding:
@@ -152,6 +182,6 @@ if __name__ == "__main__":
             seq_len=1024 * 8,
             block_size=4 * 128,
             sliding_window_size=4096,
-            is_decoding=False,
+            is_decoding=True,
             **cfg,
         )
