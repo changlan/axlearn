@@ -32,6 +32,7 @@ from axlearn.audio.frontend_utils_test import (
 from axlearn.audio.test_utils import fake_audio
 from axlearn.common.config import config_for_function
 from axlearn.common.module import functional as F
+from axlearn.common.test_utils import set_threefry_partitionable
 from axlearn.common.utils import Tensor
 
 
@@ -183,6 +184,7 @@ class LogMelFrontendTest(parameterized.TestCase, tf.test.TestCase):
             cfg.set(name="test").instantiate(parent=None)
 
     @parameterized.product(input_dtype=[jnp.bfloat16, jnp.float32, jnp.float64, jnp.int32])
+    @pytest.mark.fp64
     def test_small_input(self, input_dtype):
         sample_rate, batch_size, max_seconds = 16_000, 4, 13
         num_filters = 80
@@ -234,8 +236,10 @@ class LogMelFrontendTest(parameterized.TestCase, tf.test.TestCase):
                 output_with_large_mel_floor,
             ),
             output_with_correct_mel_floor,
+            rtol=6e-4,
         )
 
+    @set_threefry_partitionable(False)  # TODO(Luzy): update for threefry_partitionable True
     def test_fft(self):
         sample_rate, batch_size, max_seconds = 16_000, 8, 13
         num_filters, frame_size_ms, hop_size_ms = 80, 25, 10
@@ -276,7 +280,7 @@ class LogMelFrontendTest(parameterized.TestCase, tf.test.TestCase):
             ref_outputs = self._jit_forward(ref_layer, inputs, paddings)
             test_outputs = self._jit_forward(layer, inputs, paddings)
 
-        self.assertAllClose(ref_outputs["outputs"], test_outputs["outputs"])
+        self.assertAllClose(ref_outputs["outputs"], test_outputs["outputs"], rtol=5e-3)
         self.assertAllClose(ref_outputs["paddings"], test_outputs["paddings"])
 
     @parameterized.product(

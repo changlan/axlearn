@@ -26,6 +26,7 @@ from jax.experimental import checkify, mesh_utils
 from jax.sharding import PartitionSpec
 
 from axlearn.common import learner, optimizers, serialization, struct, utils
+from axlearn.common.aot_compilation import get_devices_for_topology, reshape_devices
 from axlearn.common.base_layer import BaseLayer, FactorizationSpec, ParameterSpec
 from axlearn.common.config import (
     REQUIRED,
@@ -80,6 +81,7 @@ from axlearn.common.utils import (
     get_data_dir,
     get_recursively,
     host_to_global_device_array,
+    host_to_global_specs,
     infer_mesh_shape,
     input_partition_spec,
     match_regex_rules,
@@ -944,6 +946,18 @@ class TreeUtilsTest(TestCase):
         mask = utils.sequence_mask(lengths=jnp.array(lengths), max_len=max_len, dtype=dtype)
         expected = jnp.array(expected).astype(dtype)
         self.assertNestedAllClose(mask, expected)
+
+    @parameterized.parameters(
+        dict(mask=[True, False], expected=[False, True]),
+        dict(mask=[[False, True], [True, False]], expected=[[True, False], [False, True]]),
+        dict(mask=[1, 0], expected=[False, True]),
+        dict(mask=[10, 0], expected=[False, True]),
+        dict(mask=[1.0, 0.0], expected=[False, True]),
+    )
+    def test_safe_not(self, mask, expected):
+        inverted_mask = utils.safe_not(jnp.array(mask))
+        self.assertEqual(inverted_mask.dtype, jnp.bool)
+        self.assertEqual(inverted_mask.tolist(), expected)
 
     def test_prune_empty_state(self):
         state = {
@@ -2006,6 +2020,47 @@ class HostToGlobalArrayTest(TestCase):
 
             global_x = global_x[global_idx]
             self.assertNestedAllClose(np.concatenate(local_data, axis=0), global_x)
+
+
+class HostToGlobalSpecsTest(TestCase):
+    @parameterized.parameters(
+        dict(
+            partition_spec=PartitionSpec(
+                ("data", "model"),
+            ),
+            expect_num_feeds=8,
+        ),
+        dict(partition_spec=PartitionSpec("data"), expect_num_feeds=4),
+    )
+    # TODO(kcruise,markblee): Add support for AOT test in CI.
+    @pytest.mark.skip(reason="Requires jax[tpu] for AOT.")
+    def test_host_to_global_specs(self, partition_spec, expect_num_feeds):
+        mesh_shape, topology, num_slices = (-1, 8), "v5p-32", 2
+        devices, num_per_slice = get_devices_for_topology(topology, topology_num_slices=num_slices)
+        devices, mesh_shape = reshape_devices(
+            devices=devices,
+            mesh_shape=mesh_shape,
+            devices_per_slice=num_per_slice,
+            num_slices=num_slices,
+        )
+        with jax.sharding.Mesh(np.asarray(devices), ("data", "model")) as mesh:
+            process_count = max(d.process_index for d in devices.flat) + 1
+            self.assertEqual(8, process_count)  # Should have 8 for v5p-32 x 2.
+
+            input_batch = {
+                "x": jax.ShapeDtypeStruct((4, 8), dtype=jnp.int32),
+                "y": jax.ShapeDtypeStruct((2, 8), dtype=jnp.int32),
+            }
+            actual = host_to_global_specs(input_batch, partition=partition_spec)
+
+            sharding = jax.NamedSharding(mesh, spec=partition_spec)
+            expected = jax.tree.map(
+                lambda x: jax.ShapeDtypeStruct(
+                    (x.shape[0] * expect_num_feeds, *x.shape[1:]), sharding=sharding, dtype=x.dtype
+                ),
+                input_batch,
+            )
+            self.assertNestedEqual(expected, actual)
 
 
 class ValidateContainsPathsTest(TestCase):
