@@ -120,6 +120,7 @@ pytype_library(
     deps = [
         ":common",
         "//axlearn/common:config",
+        "//axlearn/common:trainer_config_modifier",
     ],
 )
 
